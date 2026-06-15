@@ -16,6 +16,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from openjarvis.core.paths import (
+    ConfigurationError,
+    get_cache_dir,
+    get_config_dir,
+    get_config_path,
+    get_data_dir,
+)
+
 if TYPE_CHECKING:
     # Only used by type-checkers (mypy/pyright) for the ``JarvisConfig.mining``
     # field annotation. The runtime import is deferred inside
@@ -33,15 +41,24 @@ except ModuleNotFoundError:
 # Hardware dataclasses
 # ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG_DIR = Path.home() / ".openjarvis"
-DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
+# Legacy names, kept for the ~45 modules that import them. They are resolved
+# once at import via the env-aware resolver in ``openjarvis.core.paths`` (the
+# install-script model: ``OPENJARVIS_HOME`` / ``XDG_DATA_HOME`` are set before
+# the process starts). They are real module attributes — not computed lazily —
+# so existing tests can ``monkeypatch.setattr`` them and so dataclass-instance
+# defaults stay consistent. Code that must react to a mid-process env change
+# (or wants the override regardless of import order) should call
+# ``get_config_dir()`` / ``get_config_path()`` directly; the dataclass field
+# defaults below already do this via ``default_factory``.
+DEFAULT_CONFIG_DIR = get_config_dir()
+DEFAULT_CONFIG_PATH = get_config_path()
 
 
 def _ensure_config_dir() -> Path:
     """Ensure the config directory exists with restrictive permissions."""
     from openjarvis.security.file_utils import secure_mkdir
 
-    return secure_mkdir(DEFAULT_CONFIG_DIR)
+    return secure_mkdir(get_config_dir())
 
 
 @dataclass(slots=True)
@@ -188,13 +205,34 @@ def _total_ram_gb() -> float:
         if platform.system() == "Darwin":
             raw = _run_cmd(["sysctl", "-n", "hw.memsize"])
             return round(int(raw) / (1024**3), 1) if raw else 0.0
+        if platform.system() == "Windows":
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return round(stat.ullTotalPhys / (1024**3), 1)
+            return 0.0
         meminfo = Path("/proc/meminfo")
         if meminfo.exists():
             for line in meminfo.read_text().splitlines():
                 if line.startswith("MemTotal"):
                     kb = int(line.split()[1])
                     return round(kb / (1024**2), 1)
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         pass
     return 0.0
 
@@ -259,20 +297,23 @@ _MODEL_TIERS = [
     (64, "qwen3.5:27b"),
 ]
 _MODEL_TIER_FALLBACK = "qwen3.5:27b"
+_LEMONADE_DEFAULT_MODEL = "Qwen3.6-35B-A3B-GGUF"
 
 
 def recommend_model(hw: HardwareInfo, engine: str) -> str:
-    """Suggest the best Qwen3.5 model that fits the detected hardware.
+    """Suggest a default model for the selected engine and hardware.
 
-    Uses an explicit tier table mapping available memory to model size.
-    Falls back to scanning the full catalog if the tiered model is not
-    compatible with the selected engine.
+    For Lemonade, prefer the validated Qwen3.6 35B A3B GGUF default.
+    For other local engines, use the generic Qwen3.5 tier mapping.
     """
     from openjarvis.intelligence.model_catalog import BUILTIN_MODELS
 
     available_gb = _available_memory_gb(hw)
     if available_gb <= 0:
         return ""
+
+    if engine == "lemonade":
+        return _LEMONADE_DEFAULT_MODEL
 
     # Build a lookup for quick engine-compatibility checks
     catalog = {spec.model_id: spec for spec in BUILTIN_MODELS}
@@ -401,7 +442,7 @@ class GemmaCppEngineConfig:
 class LemonadeEngineConfig:
     """Per-engine config for Lemonade."""
 
-    host: str = "http://localhost:8000"
+    host: str = "http://localhost:13305"
 
 
 @dataclass
@@ -646,6 +687,52 @@ class GEPAOptimizerConfig:
 
 
 @dataclass(slots=True)
+class ACEOptimizerConfig:
+    """ACE agent optimizer config. Maps to ``[learning.agent.ace]``.
+
+    ACE (Agentic Context Engineering) evolves a *playbook* — annotated
+    natural-language strategies that get prepended to the agent's
+    context — using a Generator / Reflector / Curator triad. Unlike
+    DSPy (few-shot bootstrapping) or GEPA (Pareto-evolutionary prompt
+    mutation), ACE writes a textual playbook that the agent reads at
+    inference time.
+
+    See https://github.com/ace-agent/ace for the upstream reference.
+    Install via ``pip install -e openjarvis[learning-ace]`` once the
+    optional dep is available (ACE is not on PyPI as of v1.0.1; the
+    extra installs from the upstream git repo).
+    """
+
+    # Models for ACE's three roles. Empty string = inherit from the
+    # intelligence primitive's default cloud model.
+    generator_model: str = ""
+    reflector_model: str = ""
+    curator_model: str = ""
+
+    # Provider passed to ACE (``sambanova`` | ``together`` | ``openai``
+    # | ``commonstack``). We default to ``openai`` since that's what
+    # most OpenJarvis users have credentials for.
+    api_provider: str = "openai"
+
+    # Run parameters. Defaults mirror ACE's offline-mode quickstart.
+    num_epochs: int = 1
+    max_num_rounds: int = 3
+    eval_steps: int = 100
+    playbook_token_budget: int = 80_000
+    max_tokens: int = 4_096
+
+    # Where ACE writes intermediate playbooks + final_results.json.
+    # Empty string defaults to ``~/.openjarvis/learning/ace/<task>/``.
+    save_dir: str = ""
+    task_name: str = "openjarvis"
+
+    # Standard filter / threshold knobs shared with DSPy / GEPA.
+    min_traces: int = 20
+    agent_filter: str = ""
+    config_dir: str = ""
+
+
+@dataclass(slots=True)
 class IntelligenceLearningConfig:
     """Intelligence sub-policy config within Learning."""
 
@@ -658,9 +745,10 @@ class IntelligenceLearningConfig:
 class AgentLearningConfig:
     """Agent sub-policy config within Learning."""
 
-    policy: str = "none"  # none | dspy | gepa
+    policy: str = "none"  # none | dspy | gepa | ace
     dspy: DSPyOptimizerConfig = field(default_factory=DSPyOptimizerConfig)
     gepa: GEPAOptimizerConfig = field(default_factory=GEPAOptimizerConfig)
+    ace: ACEOptimizerConfig = field(default_factory=ACEOptimizerConfig)
 
 
 @dataclass(slots=True)
@@ -671,7 +759,9 @@ class SkillsLearningConfig:
     optimizer: str = "dspy"  # "dspy" or "gepa"
     min_traces_per_skill: int = 20
     optimization_interval_seconds: int = 86400
-    overlay_dir: str = "~/.openjarvis/learning/skills/"
+    overlay_dir: str = field(
+        default_factory=lambda: str(get_config_dir() / "learning" / "skills")
+    )
 
 
 @dataclass(slots=True)
@@ -682,6 +772,54 @@ class MetricsConfig:
     latency_weight: float = 0.2
     cost_weight: float = 0.1
     efficiency_weight: float = 0.1
+
+
+@dataclass(slots=True)
+class SpecSearchCompositeRewardConfig:
+    """Composite reward weights for Intelligence-edit training (paper Eq. 1).
+
+    R(q, y) = alpha * R_acc - beta * E_hat - gamma * L_hat - delta * C_hat
+    """
+
+    alpha: float = 0.5
+    beta: float = 0.1
+    gamma: float = 0.1
+    delta: float = 0.3
+
+
+@dataclass(slots=True)
+class SpecSearchLearningConfig:
+    """LLM-guided spec search config (paper §3.3, Algorithm 1).
+
+    Maps to ``[learning.spec_search]`` and is consumed by
+    ``SpecSearchOrchestrator.from_config`` and ``SpecSearchLoop``.
+    """
+
+    enabled: bool = False
+    teacher_model: str = "claude-opus-4-6"
+    teacher_engine: str = "cloud"  # registry key for the cloud engine
+    autonomy_mode: str = "tiered"  # auto | tiered | manual
+
+    # Per-session bounds (one diagnose/plan/execute pass)
+    min_traces: int = 20
+    max_cost_per_session_usd: float = 5.0
+    max_tool_calls_per_diagnosis: int = 30
+
+    # Multi-session loop (paper Algorithm 1)
+    stagnation_k: int = 5
+    max_total_cost_usd: float = 50.0
+    stagnation_eps: float = 0.001  # gate-score delta below this counts as no progress
+
+    # Gate (GateOK predicate)
+    max_regression: float = 0.01  # paper default: epsilon = 1%
+    min_improvement: float = 0.0
+    benchmark_subsample_size: int = 50
+    benchmark_version: str = "personal_v1"
+
+    # Composite reward (only used when an Intelligence edit triggers training)
+    composite_reward: SpecSearchCompositeRewardConfig = field(
+        default_factory=SpecSearchCompositeRewardConfig,
+    )
 
 
 @dataclass
@@ -697,6 +835,9 @@ class LearningConfig:
     )
     agent: AgentLearningConfig = field(default_factory=AgentLearningConfig)
     skills: SkillsLearningConfig = field(default_factory=SkillsLearningConfig)
+    spec_search: SpecSearchLearningConfig = field(
+        default_factory=SpecSearchLearningConfig,
+    )
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
 
     # Training pipeline
@@ -772,7 +913,7 @@ class StorageConfig:
     """Storage (memory) backend settings."""
 
     default_backend: str = "sqlite"
-    db_path: str = str(DEFAULT_CONFIG_DIR / "memory.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "memory.db"))
     context_top_k: int = 5
     context_min_score: float = 0.0
     context_max_tokens: int = 2048
@@ -824,8 +965,10 @@ class AgentConfig:
     system_prompt_path: str = ""  # path to system prompt file (.txt, .md)
     context_from_memory: bool = True  # inject relevant memory context into prompts
     default_system_prompt: str = (
-        "You are a helpful AI assistant running locally on the user's own "
-        "hardware through OpenJarvis. You are not a cloud service. Respond "
+        "You are OpenJarvis, a helpful AI assistant running locally on the "
+        "user's own hardware. You are not a cloud service, and you are not "
+        "Claude, ChatGPT, Gemini, or any other branded assistant. If asked "
+        "who or what you are, identify yourself as OpenJarvis. Respond "
         "helpfully, concisely, and accurately."
     )
 
@@ -853,8 +996,10 @@ class ServerConfig:
         default_factory=lambda: [
             "http://localhost:3000",
             "http://localhost:5173",
+            "http://localhost:5174",
             "http://127.0.0.1:3000",
             "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",
             # Tauri 2 production webview origins.
             # macOS / Linux / iOS use the custom scheme; Windows /
             # Android use http(s)://tauri.localhost. All three must
@@ -872,7 +1017,7 @@ class TelemetryConfig:
     """Telemetry persistence settings."""
 
     enabled: bool = True
-    db_path: str = str(DEFAULT_CONFIG_DIR / "telemetry.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "telemetry.db"))
     gpu_metrics: bool = False
     gpu_poll_interval_ms: int = 50
     energy_vendor: str = ""  # auto-detect or force "nvidia"/"amd"/"apple"/"cpu_rapl"
@@ -882,11 +1027,45 @@ class TelemetryConfig:
 
 
 @dataclass(slots=True)
+class AnalyticsConfig:
+    """External anonymous usage analytics (PostHog).
+
+    Separate concern from :class:`TelemetryConfig`, which stores local
+    FLOPs/energy/inference metrics in SQLite. This controls anonymized
+    usage events sent to the OpenJarvis team's PostHog instance to
+    measure setup success, retention, feature usage, and churn.
+
+    No chat content, prompts, model outputs, file paths, emails, IPs,
+    or hardware identifiers are ever sent. See ``docs/telemetry.md``.
+    """
+
+    enabled: bool = True
+    host: str = "https://34.231.106.201.sslip.io"
+    key: str = "phc_ysKu72QaxzYNmDpHFcesD2ZZAe68zkdWJEKoYYkc5e3n"
+    anon_id_path: str = field(default_factory=lambda: str(get_config_dir() / "anon_id"))
+    flush_interval_seconds: int = 30
+    flush_at_size: int = 100
+
+
+@dataclass(slots=True)
 class TracesConfig:
     """Trace system settings."""
 
     enabled: bool = True
-    db_path: str = str(DEFAULT_CONFIG_DIR / "traces.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "traces.db"))
+
+
+@dataclass(slots=True)
+class ProactiveConfig:
+    """Proactive agent — autonomous action scheduling and approval routing."""
+
+    enabled: bool = False
+    schedule: str = "0 5 * * *"  # cron expression (default: 5am daily)
+    hours_back: int = 24  # how many hours of unacted items to scan
+    timezone: str = "America/Los_Angeles"
+    # Channel to send approval notifications and receive yes/no replies.
+    # Format: "{type}:{id}", e.g. "imessage:+15551234567" or "telegram:123456789"
+    notification_channel: str = ""
 
 
 @dataclass(slots=True)
@@ -1075,7 +1254,9 @@ class SecurityConfig:
     mode: str = "redact"  # "redact" | "warn" | "block"
     secret_scanner: bool = True
     pii_scanner: bool = True
-    audit_log_path: str = str(DEFAULT_CONFIG_DIR / "audit.db")
+    audit_log_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "audit.db")
+    )
     enforce_tool_confirmation: bool = True
     merkle_audit: bool = True
     signing_key_path: str = ""
@@ -1086,7 +1267,9 @@ class SecurityConfig:
     local_engine_bypass: bool = False
     local_tool_bypass: bool = False
     profile: str = ""
-    vault_key_path: str = str(DEFAULT_CONFIG_DIR / ".vault_key")
+    vault_key_path: str = field(
+        default_factory=lambda: str(get_config_dir() / ".vault_key")
+    )
     capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
 
 
@@ -1207,7 +1390,7 @@ class SessionConfig:
     enabled: bool = False
     max_age_hours: float = 24.0
     consolidation_threshold: int = 100
-    db_path: str = str(DEFAULT_CONFIG_DIR / "sessions.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "sessions.db"))
 
 
 @dataclass(slots=True)
@@ -1215,6 +1398,9 @@ class A2AConfig:
     """Agent-to-Agent protocol settings."""
 
     enabled: bool = False
+    # Bearer token required for inbound A2A requests. Empty = unauthenticated
+    # (only safe on a trusted network). See ``A2AServer(auth_token=...)``.
+    auth_token: str = ""
 
 
 @dataclass(slots=True)
@@ -1222,7 +1408,9 @@ class OperatorsConfig:
     """Operator lifecycle settings."""
 
     enabled: bool = False
-    manifests_dir: str = "~/.openjarvis/operators"
+    manifests_dir: str = field(
+        default_factory=lambda: str(get_config_dir() / "operators")
+    )
     auto_activate: str = ""  # Comma-separated operator IDs
 
 
@@ -1248,7 +1436,7 @@ class OptimizeConfig:
     benchmark: str = ""
     max_samples: int = 50
     judge_model: str = "gpt-5-mini-2025-08-07"
-    db_path: str = str(DEFAULT_CONFIG_DIR / "optimize.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "optimize.db"))
 
 
 @dataclass(slots=True)
@@ -1256,23 +1444,27 @@ class AgentManagerConfig:
     """Persistent agent manager settings."""
 
     enabled: bool = True
-    db_path: str = str(DEFAULT_CONFIG_DIR / "agents.db")
+    db_path: str = field(default_factory=lambda: str(get_config_dir() / "agents.db"))
 
 
 @dataclass(slots=True)
 class MemoryFilesConfig:
     """Persistent memory-file paths and nudge settings."""
 
-    soul_path: str = "~/.openjarvis/SOUL.md"
-    memory_path: str = "~/.openjarvis/MEMORY.md"
-    user_path: str = "~/.openjarvis/USER.md"
+    soul_path: str = field(default_factory=lambda: str(get_config_dir() / "SOUL.md"))
+    memory_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "MEMORY.md")
+    )
+    user_path: str = field(default_factory=lambda: str(get_config_dir() / "USER.md"))
     nudge_interval: int = 10
+    persona_name: str = ""  # named persona dir under <config-dir>/personas/<name>/
 
 
 @dataclass(slots=True)
 class SystemPromptConfig:
     """Limits and strategy for system-prompt assembly."""
 
+    prefix: str = ""
     soul_max_chars: int = 4000
     memory_max_chars: int = 2500
     user_max_chars: int = 1500
@@ -1304,13 +1496,15 @@ class SkillsConfig:
     """Configuration for agent-authored procedural skills."""
 
     enabled: bool = True
-    skills_dir: str = "~/.openjarvis/skills/"
+    skills_dir: str = field(default_factory=lambda: str(get_config_dir() / "skills"))
     active: str = "*"
     auto_discover: bool = True
     auto_sync: bool = False
     nudge_interval: int = 15
     index_repo: str = "https://github.com/openjarvis/skill-index.git"
-    index_dir: str = "~/.openjarvis/skill-index/"
+    index_dir: str = field(
+        default_factory=lambda: str(get_config_dir() / "skill-index")
+    )
     max_depth: int = 5
     sandbox_dangerous: bool = True
     sources: List[SkillSourceConfig] = field(default_factory=list)
@@ -1373,6 +1567,7 @@ class JarvisConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
     traces: TracesConfig = field(default_factory=TracesConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
@@ -1390,6 +1585,7 @@ class JarvisConfig:
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
+    proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     mining: Optional["MiningConfig"] = None
 
     @property
@@ -1578,7 +1774,7 @@ def _parse_mining_section(data: dict) -> Optional["MiningConfig"]:
             pearld_rpc_url=extra.get("pearld_rpc_url", "http://localhost:44107")
         )
     elif isinstance(target_str, str) and target_str.startswith("pool:"):
-        submit_target = PoolTarget(url=target_str[len("pool:"):])
+        submit_target = PoolTarget(url=target_str[len("pool:") :])
     else:
         raise ValueError(
             f"[mining].submit_target must be 'solo' or 'pool:<url>', got {target_str!r}"
@@ -1614,7 +1810,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
     elif os.environ.get("OPENJARVIS_CONFIG"):
         config_path = Path(os.environ["OPENJARVIS_CONFIG"]).expanduser().resolve()
     else:
-        config_path = DEFAULT_CONFIG_PATH
+        config_path = get_config_path()
     if config_path.exists():
         with open(config_path, "rb") as fh:
             data = tomllib.load(fh)
@@ -1631,6 +1827,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "agent",
             "server",
             "telemetry",
+            "analytics",
             "traces",
             "security",
             "channel",
@@ -1645,6 +1842,11 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "optimize",
             "agent_manager",
             "digest",
+            "proactive",
+            "memory_files",
+            "system_prompt",
+            "compression",
+            "skills",
         )
         for section_name in top_sections:
             if section_name in data:
@@ -1946,9 +2148,14 @@ __all__ = [
     "BrowserConfig",
     "CapabilitiesConfig",
     "ChannelConfig",
+    "ConfigurationError",
     "DEFAULT_CONFIG_DIR",
     "DEFAULT_CONFIG_PATH",
     "DiscordChannelConfig",
+    "get_cache_dir",
+    "get_config_dir",
+    "get_config_path",
+    "get_data_dir",
     "EmailChannelConfig",
     "EngineConfig",
     "FeishuChannelConfig",
